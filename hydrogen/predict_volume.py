@@ -5,16 +5,21 @@ import numpy as np
 
 # [환경 설정] 모델 파일 경로 설정
 
-MODEL_SAVE_PATH = "./method_b_model.pkl"
+MODEL_SAVE_PATH = "./model.pkl"
+LEGACY_MODEL_SAVE_PATH = "./method_b_model.pkl"
+
 
 def load_trained_model():
-    if not os.path.exists(MODEL_SAVE_PATH):
+    model_path = MODEL_SAVE_PATH
+    if not os.path.exists(model_path) and os.path.exists(LEGACY_MODEL_SAVE_PATH):
+        model_path = LEGACY_MODEL_SAVE_PATH
+    if not os.path.exists(model_path):
         raise FileNotFoundError(
             f"학습된 모델 파일('{MODEL_SAVE_PATH}')을 찾을 수 없습니다.\n"
-            f"   먼저 'main_train_3.py'를 실행하여 모델을 학습시켜 주세요"
+            "   먼저 'main_train.py'를 실행하여 모델을 학습시켜 주세요."
         )
-    
-    saved_data = joblib.load(MODEL_SAVE_PATH)
+
+    saved_data = joblib.load(model_path)
     mlp = saved_data['model']
     scaler_X = saved_data['scaler_X']
     r_const = saved_data['R_CONST']

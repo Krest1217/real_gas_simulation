@@ -1,12 +1,15 @@
 import os
 import glob
+from tempfile import TemporaryDirectory
+
 import joblib
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from sklearn.compose import TransformedTargetRegressor
+from sklearn.metrics import r2_score
 from sklearn.neural_network import MLPRegressor
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import mean_absolute_error, r2_score
 
 # 한글 폰트 깨짐 방지 설정
 plt.rcParams['font.family'] = 'Malgun Gothic' if os.name == 'nt' else 'AppleGothic'
@@ -129,67 +132,45 @@ def load_and_accumulate_data():
 
 def train_or_load_model(df):
     X_all = df[['P_atm', 'T_K']].values
-    
-    # 이미 모델 파일이 존재하면 새로 학습하지 않고 즉시 불러오기
-    if os.path.exists(MODEL_SAVE_PATH):
+    saved_data = joblib.load(MODEL_SAVE_PATH) if os.path.exists(MODEL_SAVE_PATH) else None
+
+    if saved_data is not None and isinstance(saved_data['model'], TransformedTargetRegressor):
         print(f"[캐시 로드] 기존 학습된 모델('{MODEL_SAVE_PATH}')을 불러옵니다.")
-
-        saved_data = joblib.load(MODEL_SAVE_PATH)
-        mlp = saved_data['model']
+        model = saved_data['model']
         scaler_X = saved_data['scaler_X']
-        
         X_all_scaled = scaler_X.transform(X_all)
-        df['delta_V_ai'] = mlp.predict(X_all_scaled)
-        df['V_ai_L'] = df['V_ideal_L'] + df['delta_V_ai']
-        return mlp, scaler_X, df
+    else:
+        if saved_data is not None:
+            print("[모델 갱신] 기존 모델을 새 학습 방식으로 다시 학습합니다.")
+        print(f"[2단계: 신경망 학습] 전체 데이터 {len(df)}개로 학습합니다.")
 
-    print("[2단계: 신경망 학습]")
+        scaler_X = StandardScaler()
+        X_all_scaled = scaler_X.fit_transform(X_all)
+        mlp = MLPRegressor(
+            hidden_layer_sizes=(64, 64),
+            activation='tanh',
+            solver='adam',
+            learning_rate_init=0.003,
+            max_iter=300,
+            early_stopping=True,
+            n_iter_no_change=10,
+            tol=1e-4,
+            random_state=42,
+        )
+        # ΔV를 표준화해 학습하고, 예측값은 L/mol 단위로 자동 복원한다.
+        model = TransformedTargetRegressor(regressor=mlp, transformer=StandardScaler())
+        model.fit(X_all_scaled, df['delta_V'].values)
 
-    scaler_X = StandardScaler()
-    scaler_X.fit(X_all)
+        model_dir = os.path.dirname(os.path.abspath(MODEL_SAVE_PATH))
+        with TemporaryDirectory(dir=model_dir) as tmp_dir:
+            tmp_path = os.path.join(tmp_dir, 'model.pkl')
+            joblib.dump({'model': model, 'scaler_X': scaler_X, 'R_CONST': R_CONST}, tmp_path)
+            os.replace(tmp_path, MODEL_SAVE_PATH)
+        print(f"학습 완료된 모델이 '{MODEL_SAVE_PATH}'에 저장되었습니다.")
 
-    mlp = MLPRegressor(
-        hidden_layer_sizes=(64, 64),
-        activation='tanh',
-        solver='adam',
-        learning_rate_init=0.003,
-        max_iter=300,
-        early_stopping=True,
-        n_iter_no_change=10,
-        tol=1e-4,
-        random_state=42
-    )
-
-    unique_temps = sorted(df['T_K'].unique())
-    accumulated_indices = []
-
-    rng = np.random.default_rng(42)
-    for step_idx, temp in enumerate(unique_temps, start=1):
-        current_temp_indices = df[df['T_K'] == temp].index.tolist()
-        accumulated_indices.extend(current_temp_indices)
-
-        X_step = scaler_X.transform(df.loc[accumulated_indices, ['P_atm', 'T_K']].values)
-        y_step = df.loc[accumulated_indices, 'delta_V'].values
-
-        perm = rng.permutation(len(X_step))
-        mlp.fit(X_step[perm], y_step[perm])
-
-        delta_V_pred = mlp.predict(X_step)
-        V_ai_step = df.loc[accumulated_indices, 'V_ideal_L'].values + delta_V_pred
-        V_real_step = df.loc[accumulated_indices, 'V_real_L'].values
-        mape = np.mean(np.abs((V_real_step - V_ai_step) / V_real_step)) * 100
-
-        print(f"[Step {step_idx:02d}] 온도 {temp:5.1f} K 학습 완료 | "
-              f"누적 데이터: {len(X_step):4d}개 | AI 평균 오차율: {mape:.3f}%")
-
-    X_all_scaled = scaler_X.transform(X_all)
-    df['delta_V_ai'] = mlp.predict(X_all_scaled)
+    df['delta_V_ai'] = model.predict(X_all_scaled)
     df['V_ai_L'] = df['V_ideal_L'] + df['delta_V_ai']
-
-    joblib.dump({'model': mlp, 'scaler_X': scaler_X, 'R_CONST': R_CONST}, MODEL_SAVE_PATH)
-    print(f"\n학습 완료된 모델이 '{MODEL_SAVE_PATH}'에 저장되었습니다.")
-
-    return mlp, scaler_X, df
+    return model, scaler_X, df
 
 
 # STEP 3: 상세 통계 출력 후 3차원 그래프 시각화
@@ -209,7 +190,7 @@ def print_statistics_and_plot(df, mlp, scaler_X):
     ai_r2 = r2_score(df['V_real_L'], df['V_ai_L'])
 
     # 그래프 출력 전 상세 통계 리포트 출력
-    print("[최종 통계 및 상세 오차 분석 리포트]")
+    print("[전체 입력 데이터 기준 오차 통계 · 별도 검증 데이터 없음]")
     print("이상기체 방정식 (PV = nRT) 통계:")
     print(f"평균 부피 오차율 : {ideal_mean:.2f}%")
     print(f"최대 오차 지점   : {ideal_max_row['abs_error_ideal']:.2f}% (온도: {ideal_max_row['T_K']} K, 압력: {ideal_max_row['P_atm']} atm)")
